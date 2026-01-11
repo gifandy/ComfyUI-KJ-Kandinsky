@@ -117,14 +117,43 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
     def get_ada_values(
-        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice = slice(None, None)
+        self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice = slice(None, None), num_tokens=None
     ):
         num_ada_params = scale_shift_table.shape[0]
 
-        ada_values = (
-            scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
-        ).unbind(dim=2)
+        if isinstance(timestep, tuple) and len(timestep) == 4: # (unique_emb, inverse_indices_1d, original_batch_size, original_num_tokens)
+            unique_emb, inverse_indices_1d, orig_batch_size, orig_num_tokens = timestep
+
+            # Compute ada values on unique embeddings only
+            unique_reshaped = unique_emb.reshape(len(unique_emb), num_ada_params, -1)[:, indices, :]
+            table_values = scale_shift_table[indices].unsqueeze(0).to(device=unique_emb.device, dtype=unique_emb.dtype)
+            unique_ada = (table_values + unique_reshaped).unbind(dim=1)
+
+            # Expand each ada value using inverse indices
+            ada_values = tuple(
+                unique_val[inverse_indices_1d].view(orig_batch_size, orig_num_tokens, -1)
+                for unique_val in unique_ada
+            )
+            return ada_values
+
+        # Reshape and process embeddings
+        # timestep shape: [batch, num_tokens, dim] where dim = num_ada_params * inner_dim
+        timestep_reshaped = timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
+
+        table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=timestep.device, dtype=timestep.dtype)
+
+        # Expand timestep to match target sequence length if needed
+        if num_tokens is not None and timestep.shape[1] < num_tokens:
+            # Expand timestep_reshaped to match target sequence length
+            repeats = num_tokens // timestep.shape[1]
+            if repeats == 1:
+                pass
+            elif repeats * timestep.shape[1] == num_tokens:
+                timestep_reshaped = torch.repeat_interleave(timestep_reshaped, repeats, dim=1)
+            else:
+                timestep_reshaped = torch.repeat_interleave(timestep_reshaped, repeats + 1, dim=1)[:, :num_tokens]
+
+        ada_values = (table_values + timestep_reshaped).unbind(dim=2)
         return ada_values
 
     def get_av_ca_ada_values(
@@ -134,16 +163,19 @@ class BasicAVTransformerBlock(nn.Module):
         scale_shift_timestep: torch.Tensor,
         gate_timestep: torch.Tensor,
         num_scale_shift_values: int = 4,
+        num_tokens=None,
     ):
         scale_shift_ada_values = self.get_ada_values(
             scale_shift_table[:num_scale_shift_values, :],
             batch_size,
             scale_shift_timestep,
+            num_tokens=num_tokens,
         )
         gate_ada_values = self.get_ada_values(
             scale_shift_table[num_scale_shift_values:, :],
             batch_size,
             gate_timestep,
+            num_tokens=num_tokens,
         )
 
         scale_shift_chunks = [t.squeeze(2) for t in scale_shift_ada_values]
@@ -179,7 +211,7 @@ class BasicAVTransformerBlock(nn.Module):
 
         if run_vx:
             vshift_msa, vscale_msa, vgate_msa = (
-                self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 3))
+                self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(0, 3), num_tokens=vx.shape[1])
             )
 
             norm_vx = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_msa) + vshift_msa
@@ -195,7 +227,7 @@ class BasicAVTransformerBlock(nn.Module):
 
         if run_ax:
             ashift_msa, ascale_msa, agate_msa = (
-                self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 3))
+                self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(0, 3), num_tokens=ax.shape[1])
             )
 
             norm_ax = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_msa) + ashift_msa
@@ -229,6 +261,7 @@ class BasicAVTransformerBlock(nn.Module):
                 ax.shape[0],
                 a_cross_scale_shift_timestep,
                 a_cross_gate_timestep,
+                num_tokens=ax.shape[1],
             )
 
             (
@@ -242,6 +275,7 @@ class BasicAVTransformerBlock(nn.Module):
                 vx.shape[0],
                 v_cross_scale_shift_timestep,
                 v_cross_gate_timestep,
+                num_tokens=vx.shape[1],
             )
 
             if run_a2v:
@@ -298,7 +332,7 @@ class BasicAVTransformerBlock(nn.Module):
 
         if run_vx:
             vshift_mlp, vscale_mlp, vgate_mlp = (
-                self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(3, None))
+                self.get_ada_values(self.scale_shift_table, vx.shape[0], v_timestep, slice(3, None), num_tokens=vx.shape[1])
             )
 
             vx_scaled = comfy.ldm.common_dit.rms_norm(vx) * (1 + vscale_mlp) + vshift_mlp
@@ -307,7 +341,7 @@ class BasicAVTransformerBlock(nn.Module):
 
         if run_ax:
             ashift_mlp, ascale_mlp, agate_mlp = (
-                self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, None))
+                self.get_ada_values(self.audio_scale_shift_table, ax.shape[0], a_timestep, slice(3, None), num_tokens=ax.shape[1])
             )
 
             ax_scaled = comfy.ldm.common_dit.rms_norm(ax) * (1 + ascale_mlp) + ashift_mlp
@@ -538,66 +572,84 @@ class LTXAVModel(LTXVModel):
 
     def _prepare_timestep(self, timestep, batch_size, hidden_dtype, **kwargs):
         """Prepare timestep embeddings."""
-        # TODO: some code reuse is needed here.
         grid_mask = kwargs.get("grid_mask", None)
         if grid_mask is not None:
             timestep = timestep[:, grid_mask]
 
-        timestep = timestep * self.timestep_scale_multiplier
-        v_timestep, v_embedded_timestep = self.adaln_single(
-            timestep.flatten(),
+        timestep_scaled = timestep * self.timestep_scale_multiplier
+        # Get original shape for reconstruction
+        orig_shape = timestep_scaled.shape
+        B = batch_size
+        T = orig_shape[1] if len(orig_shape) > 1 else 1
+
+        # Pre-compute embeddings only for unique timestep values
+        unique_timesteps, inverse_indices_1d = torch.unique(timestep_scaled.flatten(), return_inverse=True)
+
+        # Compute embeddings for unique timesteps only
+        unique_emb, unique_embedded = self.adaln_single(
+            unique_timesteps,
             {"resolution": None, "aspect_ratio": None},
-            batch_size=batch_size,
+            batch_size=len(unique_timesteps),
             hidden_dtype=hidden_dtype,
         )
+        del unique_timesteps
 
-        # Second dimension is 1 or number of tokens (if timestep_per_token)
-        v_timestep = v_timestep.view(batch_size, -1, v_timestep.shape[-1])
-        v_embedded_timestep = v_embedded_timestep.view(
-            batch_size, -1, v_embedded_timestep.shape[-1]
-        )
+        # Store as tuple, expand on-demand
+        v_timestep = (unique_emb, inverse_indices_1d, B, T) # (unique_emb, inverse_indices_1d, batch_size, num_tokens)
+        v_embedded_timestep = (unique_embedded, inverse_indices_1d, B, T)
 
         # Prepare audio timestep
         a_timestep = kwargs.get("a_timestep")
         if a_timestep is not None:
-            a_timestep = a_timestep * self.timestep_scale_multiplier
+            a_timestep_scaled = a_timestep * self.timestep_scale_multiplier
             av_ca_factor = self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
 
+            # Cross-attention timesteps (use first token only)
             av_ca_audio_scale_shift_timestep, _ = self.av_ca_audio_scale_shift_adaln_single(
-                a_timestep.flatten(),
+                a_timestep_scaled[:, :1].flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_video_scale_shift_timestep, _ = self.av_ca_video_scale_shift_adaln_single(
-                timestep.flatten(),
+                timestep_scaled[:, :1].flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_a2v_gate_noise_timestep, _ = self.av_ca_a2v_gate_adaln_single(
-                timestep.flatten() * av_ca_factor,
+                (timestep_scaled[:, :1] * av_ca_factor).flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_v2a_gate_noise_timestep, _ = self.av_ca_v2a_gate_adaln_single(
-                a_timestep.flatten() * av_ca_factor,
+                (a_timestep_scaled[:, :1] * av_ca_factor).flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
 
-            a_timestep, a_embedded_timestep = self.audio_adaln_single(
-                a_timestep.flatten(),
+            # Pre-compute embeddings for unique audio timesteps
+            unique_a_timesteps, inverse_a_indices_1d = torch.unique(a_timestep_scaled.flatten(), return_inverse=True)
+
+            unique_a_emb, unique_a_embedded = self.audio_adaln_single(
+                unique_a_timesteps,
                 {"resolution": None, "aspect_ratio": None},
-                batch_size=batch_size,
+                batch_size=len(unique_a_timesteps),
                 hidden_dtype=hidden_dtype,
             )
-            a_timestep = a_timestep.view(batch_size, -1, a_timestep.shape[-1])
-            a_embedded_timestep = a_embedded_timestep.view(
-                batch_size, -1, a_embedded_timestep.shape[-1]
-            )
+
+            # Store as lightweight tuple
+            a_orig_shape = a_timestep_scaled.shape
+            B_a = batch_size
+            T_a = a_orig_shape[1] if len(a_orig_shape) > 1 else 1
+            a_timestep = (unique_a_emb, inverse_a_indices_1d, B_a, T_a)
+            a_embedded_timestep = (unique_a_embedded, inverse_a_indices_1d, B_a, T_a)
+
+            # Free audio unique tensors
+            del unique_a_timesteps, a_timestep_scaled
+
             cross_av_timestep_ss = [
                 av_ca_audio_scale_shift_timestep,
                 av_ca_video_scale_shift_timestep,
@@ -608,9 +660,19 @@ class LTXAVModel(LTXVModel):
                 [t.view(batch_size, -1, t.shape[-1]) for t in cross_av_timestep_ss]
             )
         else:
-            a_timestep = timestep
-            a_embedded_timestep = kwargs.get("embedded_timestep")
+            # No separate audio timestep - compute from video timestep (first token)
+            # Use audio_adaln_single for correct dimensions
+            a_timestep_tensor, a_embedded_timestep_tensor = self.audio_adaln_single(
+                timestep_scaled[:, :1].flatten(),
+                {"resolution": None, "aspect_ratio": None},
+                batch_size=batch_size,
+                hidden_dtype=hidden_dtype,
+            )
+            a_timestep = a_timestep_tensor.view(batch_size, -1, a_timestep_tensor.shape[-1])
+            a_embedded_timestep = a_embedded_timestep_tensor.view(batch_size, -1, a_embedded_timestep_tensor.shape[-1])
             cross_av_timestep_ss = []
+
+        del timestep_scaled
 
         return [v_timestep, a_timestep, cross_av_timestep_ss], [
             v_embedded_timestep,
@@ -767,23 +829,35 @@ class LTXAVModel(LTXVModel):
         ax = x[1]
         v_embedded_timestep = embedded_timestep[0]
         a_embedded_timestep = embedded_timestep[1]
+
+        # Expand embedded timesteps from tuple format
+        if isinstance(v_embedded_timestep, tuple) and len(v_embedded_timestep) == 4:
+            unique_embedded, inverse_indices_1d, B, T = v_embedded_timestep
+            v_embedded_timestep = unique_embedded[inverse_indices_1d].view(B, T, -1)
+
         vx = super()._process_output(vx, v_embedded_timestep, keyframe_idxs, **kwargs)
 
-        # Process audio output
-        a_scale_shift_values = (
-            self.audio_scale_shift_table[None, None].to(device=a_embedded_timestep.device, dtype=a_embedded_timestep.dtype)
-            + a_embedded_timestep[:, :, None]
-        )
-        a_shift, a_scale = a_scale_shift_values[:, :, 0], a_scale_shift_values[:, :, 1]
+        # Process audio output only if audio is present
+        if ax.numel() > 0:
+            # Expand audio embedded timestep from tuple format
+            if isinstance(a_embedded_timestep, tuple) and len(a_embedded_timestep) == 4:
+                unique_a_embedded, inverse_a_indices_1d, B_a, T_a = a_embedded_timestep
+                a_embedded_timestep = unique_a_embedded[inverse_a_indices_1d].view(B_a, T_a, -1)
 
-        ax = self.audio_norm_out(ax)
-        ax = ax * (1 + a_scale) + a_shift
-        ax = self.audio_proj_out(ax)
+            a_scale_shift_values = (
+                self.audio_scale_shift_table[None, None].to(device=a_embedded_timestep.device, dtype=a_embedded_timestep.dtype)
+                + a_embedded_timestep[:, :, None]
+            )
+            a_shift, a_scale = a_scale_shift_values[:, :, 0], a_scale_shift_values[:, :, 1]
 
-        # Unpatchify audio
-        ax = self.a_patchifier.unpatchify(
-            ax, channels=self.num_audio_channels, freq=self.audio_frequency_bins
-        )
+            ax = self.audio_norm_out(ax)
+            ax = ax * (1 + a_scale) + a_shift
+            ax = self.audio_proj_out(ax)
+
+            # Unpatchify audio
+            ax = self.a_patchifier.unpatchify(
+                ax, channels=self.num_audio_channels, freq=self.audio_frequency_bins
+            )
 
         # Recombine audio and video
         original_shape = kwargs.get("av_orig_shape")
