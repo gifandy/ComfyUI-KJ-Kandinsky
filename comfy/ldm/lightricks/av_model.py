@@ -23,16 +23,27 @@ class CompressedTimestep:
             patches_per_frame: Number of spatial patches per frame (height * width in latent space)
         """
         self.batch_size, num_tokens, self.feature_dim = tensor.shape
-        self.patches_per_frame = patches_per_frame
-        self.num_frames = num_tokens // patches_per_frame
 
-        # Reshape to [batch, frames, patches_per_frame, feature_dim] and store one value per frame
-        # All patches in a frame are identical, so we only keep the first one
-        reshaped = tensor.view(self.batch_size, self.num_frames, patches_per_frame, self.feature_dim)
-        self.data = reshaped[:, :, 0, :].contiguous()  # [batch, frames, feature_dim]
+        # Check if compression is valid (num_tokens must be divisible by patches_per_frame)
+        if num_tokens % patches_per_frame == 0 and num_tokens >= patches_per_frame:
+            self.patches_per_frame = patches_per_frame
+            self.num_frames = num_tokens // patches_per_frame
+
+            # Reshape to [batch, frames, patches_per_frame, feature_dim] and store one value per frame
+            # All patches in a frame are identical, so we only keep the first one
+            reshaped = tensor.view(self.batch_size, self.num_frames, patches_per_frame, self.feature_dim)
+            self.data = reshaped[:, :, 0, :].contiguous()  # [batch, frames, feature_dim]
+        else:
+            # Not divisible or too small - store directly without compression
+            self.patches_per_frame = 1
+            self.num_frames = num_tokens
+            self.data = tensor
 
     def expand(self):
         """Expand back to original tensor."""
+        if self.patches_per_frame == 1:
+            return self.data
+
         # Expand per-frame data back to full spatial resolution
         # [batch, frames, feature_dim] -> [batch, frames, patches_per_frame, feature_dim] -> [batch, tokens, feature_dim]
         expanded = self.data.unsqueeze(2).expand(
@@ -44,6 +55,18 @@ class CompressedTimestep:
         """Compute ada values on compressed per-frame data, then expand spatially."""
         num_ada_params = scale_shift_table.shape[0]
 
+        if self.patches_per_frame == 1:
+            # No compression - compute directly
+            num_tokens = self.data.shape[1]
+            dim_per_param = self.feature_dim // num_ada_params
+            reshaped = self.data.reshape(batch_size, num_tokens, num_ada_params, dim_per_param)[:, :, indices, :]
+            table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(
+                device=self.data.device, dtype=self.data.dtype
+            )
+            ada_values = (table_values + reshaped).unbind(dim=2)
+            return ada_values
+
+        # Compressed path: compute on per-frame data then expand spatially
         # Reshape: [batch, frames, feature_dim] -> [batch, frames, num_ada_params, dim_per_param]
         frame_reshaped = self.data.reshape(batch_size, self.num_frames, num_ada_params, -1)[:, :, indices, :]
         table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(
