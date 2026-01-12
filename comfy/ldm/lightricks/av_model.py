@@ -13,14 +13,12 @@ import comfy.ldm.common_dit
 
 class CompressedTimestep:
     """Store video timestep embeddings in compressed form using per-frame indexing."""
-
     __slots__ = ('data', 'batch_size', 'num_frames', 'patches_per_frame', 'feature_dim')
 
     def __init__(self, tensor, patches_per_frame):
         """
-        Args:
-            tensor: [batch_size, num_tokens, feature_dim] tensor where num_tokens = num_frames * patches_per_frame
-            patches_per_frame: Number of spatial patches per frame (height * width in latent space)
+        tensor: [batch_size, num_tokens, feature_dim] tensor where num_tokens = num_frames * patches_per_frame
+        patches_per_frame: Number of spatial patches per frame (height * width in latent space)
         """
         self.batch_size, num_tokens, self.feature_dim = tensor.shape
 
@@ -44,29 +42,24 @@ class CompressedTimestep:
         if self.patches_per_frame == 1:
             return self.data
 
-        # Expand per-frame data back to full spatial resolution
         # [batch, frames, feature_dim] -> [batch, frames, patches_per_frame, feature_dim] -> [batch, tokens, feature_dim]
-        expanded = self.data.unsqueeze(2).expand(
-            self.batch_size, self.num_frames, self.patches_per_frame, self.feature_dim
-        )
+        expanded = self.data.unsqueeze(2).expand(self.batch_size, self.num_frames, self.patches_per_frame, self.feature_dim)
         return expanded.reshape(self.batch_size, -1, self.feature_dim)
 
     def expand_for_computation(self, scale_shift_table, batch_size, indices):
         """Compute ada values on compressed per-frame data, then expand spatially."""
         num_ada_params = scale_shift_table.shape[0]
 
+        # No compression - compute directly
         if self.patches_per_frame == 1:
-            # No compression - compute directly
             num_tokens = self.data.shape[1]
             dim_per_param = self.feature_dim // num_ada_params
             reshaped = self.data.reshape(batch_size, num_tokens, num_ada_params, dim_per_param)[:, :, indices, :]
-            table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(
-                device=self.data.device, dtype=self.data.dtype
-            )
+            table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(device=self.data.device, dtype=self.data.dtype)
             ada_values = (table_values + reshaped).unbind(dim=2)
             return ada_values
 
-        # Compressed path: compute on per-frame data then expand spatially
+        # Compressed: compute on per-frame data then expand spatially
         # Reshape: [batch, frames, feature_dim] -> [batch, frames, num_ada_params, dim_per_param]
         frame_reshaped = self.data.reshape(batch_size, self.num_frames, num_ada_params, -1)[:, :, indices, :]
         table_values = scale_shift_table[indices].unsqueeze(0).unsqueeze(0).to(
@@ -670,10 +663,10 @@ class LTXAVModel(LTXVModel):
 
             # Compress cross-attention timesteps (only video side, audio is too small to benefit)
             cross_av_timestep_ss = [
-                av_ca_audio_scale_shift_timestep.view(batch_size, -1, av_ca_audio_scale_shift_timestep.shape[-1]),  # audio - no compression
+                av_ca_audio_scale_shift_timestep.view(batch_size, -1, av_ca_audio_scale_shift_timestep.shape[-1]),
                 CompressedTimestep(av_ca_video_scale_shift_timestep.view(batch_size, -1, av_ca_video_scale_shift_timestep.shape[-1]), v_patches_per_frame),  # video - compressed
                 CompressedTimestep(av_ca_a2v_gate_noise_timestep.view(batch_size, -1, av_ca_a2v_gate_noise_timestep.shape[-1]), v_patches_per_frame),  # video - compressed
-                av_ca_v2a_gate_noise_timestep.view(batch_size, -1, av_ca_v2a_gate_noise_timestep.shape[-1]),  # audio - no compression
+                av_ca_v2a_gate_noise_timestep.view(batch_size, -1, av_ca_v2a_gate_noise_timestep.shape[-1]),
             ]
 
             a_timestep, a_embedded_timestep = self.audio_adaln_single(
@@ -682,7 +675,7 @@ class LTXAVModel(LTXVModel):
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
-            # Audio timesteps - no compression needed (small size)
+            # Audio timesteps
             a_timestep = a_timestep.view(batch_size, -1, a_timestep.shape[-1])
             a_embedded_timestep = a_embedded_timestep.view(batch_size, -1, a_embedded_timestep.shape[-1])
         else:
@@ -849,7 +842,6 @@ class LTXAVModel(LTXVModel):
         # Expand compressed video timestep if needed
         if isinstance(v_embedded_timestep, CompressedTimestep):
             v_embedded_timestep = v_embedded_timestep.expand()
-        # Audio timestep is not compressed, no expansion needed
 
         vx = super()._process_output(vx, v_embedded_timestep, keyframe_idxs, **kwargs)
 
