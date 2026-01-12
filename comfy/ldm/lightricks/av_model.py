@@ -577,10 +577,14 @@ class LTXAVModel(LTXVModel):
             timestep = timestep[:, grid_mask]
 
         timestep_scaled = timestep * self.timestep_scale_multiplier
-        # Get original shape for reconstruction
+
+        # Flatten to 1D for processing, remember original shape
         orig_shape = timestep_scaled.shape
         B = batch_size
-        T = orig_shape[1] if len(orig_shape) > 1 else 1
+        # For T2V: [B, 1, 1], with grid_mask: shape is [B, T]
+        if len(orig_shape) == 3:
+            timestep_scaled = timestep_scaled.squeeze(-1)
+        T = timestep_scaled.shape[1] if len(timestep_scaled.shape) > 1 else 1
 
         # Pre-compute embeddings only for unique timestep values
         unique_timesteps, inverse_indices_1d = torch.unique(timestep_scaled.flatten(), return_inverse=True)
@@ -605,26 +609,30 @@ class LTXAVModel(LTXVModel):
             av_ca_factor = self.av_ca_timestep_scale_multiplier / self.timestep_scale_multiplier
 
             # Cross-attention timesteps (use first token only)
+            # Handle both 1D and 2D tensors
+            a_first_token = a_timestep_scaled[:, :1].flatten() if len(a_timestep_scaled.shape) > 1 else a_timestep_scaled
+            v_first_token = timestep_scaled[:, :1].flatten() if len(timestep_scaled.shape) > 1 else timestep_scaled
+
             av_ca_audio_scale_shift_timestep, _ = self.av_ca_audio_scale_shift_adaln_single(
-                a_timestep_scaled[:, :1].flatten(),
+                a_first_token,
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_video_scale_shift_timestep, _ = self.av_ca_video_scale_shift_adaln_single(
-                timestep_scaled[:, :1].flatten(),
+                v_first_token,
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_a2v_gate_noise_timestep, _ = self.av_ca_a2v_gate_adaln_single(
-                (timestep_scaled[:, :1] * av_ca_factor).flatten(),
+                (v_first_token * av_ca_factor) if len(timestep_scaled.shape) == 1 else (timestep_scaled[:, :1] * av_ca_factor).flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
             )
             av_ca_v2a_gate_noise_timestep, _ = self.av_ca_v2a_gate_adaln_single(
-                (a_timestep_scaled[:, :1] * av_ca_factor).flatten(),
+                (a_first_token * av_ca_factor) if len(a_timestep_scaled.shape) == 1 else (a_timestep_scaled[:, :1] * av_ca_factor).flatten(),
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
@@ -662,8 +670,14 @@ class LTXAVModel(LTXVModel):
         else:
             # No separate audio timestep - compute from video timestep (first token)
             # Use audio_adaln_single for correct dimensions
+            # Handle both 1D [B] and 2D [B, T] timestep_scaled
+            if len(timestep_scaled.shape) == 1:
+                first_token = timestep_scaled
+            else:
+                first_token = timestep_scaled[:, :1].flatten()
+
             a_timestep_tensor, a_embedded_timestep_tensor = self.audio_adaln_single(
-                timestep_scaled[:, :1].flatten(),
+                first_token,
                 {"resolution": None, "aspect_ratio": None},
                 batch_size=batch_size,
                 hidden_dtype=hidden_dtype,
