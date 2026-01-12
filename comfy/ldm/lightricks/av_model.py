@@ -15,7 +15,7 @@ class CompressedTimestep:
     """Store video timestep embeddings in compressed form using per-frame indexing."""
     __slots__ = ('data', 'batch_size', 'num_frames', 'patches_per_frame', 'feature_dim')
 
-    def __init__(self, tensor, patches_per_frame):
+    def __init__(self, tensor: torch.Tensor, patches_per_frame: int):
         """
         tensor: [batch_size, num_tokens, feature_dim] tensor where num_tokens = num_frames * patches_per_frame
         patches_per_frame: Number of spatial patches per frame (height * width in latent space)
@@ -46,7 +46,7 @@ class CompressedTimestep:
         expanded = self.data.unsqueeze(2).expand(self.batch_size, self.num_frames, self.patches_per_frame, self.feature_dim)
         return expanded.reshape(self.batch_size, -1, self.feature_dim)
 
-    def expand_for_computation(self, scale_shift_table, batch_size, indices):
+    def expand_for_computation(self, scale_shift_table: torch.Tensor, batch_size: int, indices: slice = slice(None, None)):
         """Compute ada values on compressed per-frame data, then expand spatially."""
         num_ada_params = scale_shift_table.shape[0]
 
@@ -180,7 +180,7 @@ class BasicAVTransformerBlock(nn.Module):
         )
 
     def get_ada_values(
-        self, scale_shift_table: torch.Tensor, batch_size: int, timestep, indices: slice = slice(None, None)
+        self, scale_shift_table: torch.Tensor, batch_size: int, timestep: torch.Tensor, indices: slice = slice(None, None)
     ):
         if isinstance(timestep, CompressedTimestep):
             return timestep.expand_for_computation(scale_shift_table, batch_size, indices)
